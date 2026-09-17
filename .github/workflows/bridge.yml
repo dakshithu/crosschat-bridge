@@ -1,0 +1,75 @@
+name: Discord-Zoom Bridge
+
+on:
+  # Kicks off a fresh run automatically before the previous one is killed.
+  # GitHub Actions hard-caps a single job at 6 hours, so this runs every 5.
+  schedule:
+    - cron: '0 */5 * * *'
+  # Lets you trigger a run manually from the Actions tab, e.g. after
+  # updating auth.json or right after setting this up.
+  workflow_dispatch: {}
+
+# Prevents two copies of the bridge running at once if a run overlaps
+# with the next scheduled trigger.
+concurrency:
+  group: discord-zoom-bridge
+  cancel-in-progress: false
+
+jobs:
+  run-bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340 # 5h40m — under the 6h hard limit
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      # Restores the last saved Zoom login session (auth.json), so the
+      # bridge doesn't have to log in from scratch on every restart.
+      - name: Restore Zoom session cache
+        id: cache-auth
+        uses: actions/cache@v4
+        with:
+          path: auth.json
+          key: zoom-auth-${{ github.run_number }}
+          restore-keys: |
+            zoom-auth-
+
+      # First-ever run: no cache exists yet, so seed auth.json from a
+      # one-time secret (see setup instructions).
+      - name: Seed auth.json from secret if no cache was found
+        if: steps.cache-auth.outputs.cache-hit != 'true'
+        run: |
+          if [ -f auth.json ]; then
+            echo "auth.json restored from cache."
+          elif [ -n "${{ secrets.ZOOM_AUTH_STATE_B64 }}" ]; then
+            echo "${{ secrets.ZOOM_AUTH_STATE_B64 }}" | base64 -d > auth.json
+            echo "auth.json seeded from ZOOM_AUTH_STATE_B64 secret."
+          else
+            echo "::error::No cached auth.json and no ZOOM_AUTH_STATE_B64 secret found. See setup instructions to generate one."
+            exit 1
+          fi
+
+      - name: Run bridge
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ZOOM_INVITE_URL: ${{ secrets.ZOOM_INVITE_URL }}
+          ZOOM_VERIFICATION_TOKEN: ${{ secrets.ZOOM_VERIFICATION_TOKEN }}
+          ZOOM_INCOMING_WEBHOOK_URL_RAW: ${{ secrets.ZOOM_INCOMING_WEBHOOK_URL_RAW }}
+          IS_HEADLESS: 'true'
+          # Self-exits at 5h30m so auth.json gets saved and the cache step
+          # below can run before the 5h40m job timeout kills it outright.
+          MAX_RUNTIME_SECONDS: '19800'
+        run: node index.js
