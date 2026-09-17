@@ -1,5 +1,6 @@
 const { chromium } = require('playwright');
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const fs = require('fs');
 
 // Configuration — all secrets now come from environment variables.
 // Locally: put these in a .env file (loaded via dotenv) and never commit it.
@@ -33,8 +34,20 @@ const IS_HEADLESS = process.env.IS_HEADLESS !== 'false';
 // Set by the workflow, in seconds. Defaults to running forever (local use).
 const MAX_RUNTIME_SECONDS = parseInt(process.env.MAX_RUNTIME_SECONDS || '0', 10);
 
-// How often to flush the Zoom login session to auth.json, in ms.
+// How often to flush the Zoom login session, in ms.
 const SESSION_SAVE_INTERVAL_MS = 5 * 60 * 1000;
+
+// Helper function to save both auth.json and auth.b64
+async function syncStorageState(context, label = '') {
+  try {
+    await context.storageState({ path: 'auth.json' });
+    const jsonContent = fs.readFileSync('auth.json');
+    fs.writeFileSync('auth.b64', jsonContent.toString('base64'), 'utf-8');
+    console.log(`[Session] ${label ? label + ': ' : ''}Saved auth.json and synced auth.b64.`);
+  } catch (err) {
+    console.error(`[Session] Failed to save/sync storage state (${label}):`, err);
+  }
+}
 
 const discordClient = new Client({
   intents: [
@@ -182,7 +195,6 @@ async function uploadToCleanHost(url, filename = 'image.png') {
 }
 
 // Relays Discord messages + re-hosted attachments into Zoom Webhook Cards
-// Relays Discord messages + re-hosted attachments into Zoom Webhook Cards
 async function sendToZoomWebhook(authorName, textContent, replyContext = null, attachments = []) {
   try {
     const subHeadText = replyContext
@@ -217,13 +229,11 @@ async function sendToZoomWebhook(authorName, textContent, replyContext = null, a
       const finalUrl = directUrl || att.url;
 
       if (isImage) {
-        // Zoom expects images in the attachments container
         cardAttachments.push({
           img_url: finalUrl,
           ext: att.name ? att.name.split('.').pop() : 'png'
         });
       } else {
-        // Non-image files formatted cleanly as a clickable download row
         bodyItems.push({
           type: "message",
           text: `📁 **Attachment:** [${att.name || 'Download'}](${finalUrl})`
@@ -260,7 +270,6 @@ async function sendToZoomWebhook(authorName, textContent, replyContext = null, a
       body: bodyItems
     };
 
-    // Attach native image preview blocks if images exist
     if (cardAttachments.length > 0) {
       contentPayload.attachments = cardAttachments;
     }
@@ -325,6 +334,20 @@ async function sendReactionToZoom(userName, emojiString, originalSnippet) {
 }
 
 async function startBridge() {
+  // Decode auth.b64 into auth.json if it exists
+  if (fs.existsSync('auth.b64')) {
+    try {
+      const b64Data = fs.readFileSync('auth.b64', 'utf-8').trim();
+      const decodedJson = Buffer.from(b64Data, 'base64').toString('utf-8');
+      fs.writeFileSync('auth.json', decodedJson, 'utf-8');
+      console.log('[Auth] Decoded auth.b64 into auth.json successfully.');
+    } catch (err) {
+      console.error('[Auth] Failed to decode auth.b64:', err);
+    }
+  } else {
+    console.warn('[Auth] auth.b64 not found. Falling back to auth.json if present.');
+  }
+
   console.log('Launching Playwright browser...');
   const browser = await chromium.launch({
     headless: IS_HEADLESS,
@@ -338,7 +361,7 @@ async function startBridge() {
   });
 
   const context = await browser.newContext({
-    storageState: 'auth.json',
+    storageState: fs.existsSync('auth.json') ? 'auth.json' : undefined,
     viewport: { width: 1920, height: 1080 },
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
     locale: 'en-US',
@@ -631,35 +654,19 @@ async function startBridge() {
   await discordClient.login(DISCORD_BOT_TOKEN);
   console.log('Two-way Discord <-> Zoom bridge is active!');
 
-  // Save immediately once things are up, so a working session is captured
-  // right away instead of waiting for the first periodic interval.
-  try {
-    await context.storageState({ path: 'auth.json' });
-    console.log('[Session] Initial auth.json saved.');
-  } catch (err) {
-    console.error('[Session] Failed to save initial auth.json:', err);
-  }
+  // Save initial auth checkpoint
+  await syncStorageState(context, 'Initial checkpoint');
 
-  // Periodically save the Zoom login session so a restart doesn't require
-  // logging in again.
+  // Periodically save the Zoom login session
   const saveInterval = setInterval(async () => {
-    try {
-      await context.storageState({ path: 'auth.json' });
-      console.log('[Session] Saved auth.json checkpoint.');
-    } catch (err) {
-      console.error('[Session] Failed to save auth.json:', err);
-    }
+    await syncStorageState(context, 'Periodic interval');
   }, SESSION_SAVE_INTERVAL_MS);
 
   async function shutdown(reason) {
     console.log(`Shutting down (${reason})...`);
     clearInterval(saveInterval);
-    try {
-      await context.storageState({ path: 'auth.json' });
-      console.log('[Session] Final auth.json saved before exit.');
-    } catch (err) {
-      console.error('[Session] Failed to save auth.json on shutdown:', err);
-    }
+    await syncStorageState(context, 'Final shutdown');
+
     try {
       await browser.close();
     } catch (_) {}
@@ -672,8 +679,6 @@ async function startBridge() {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  // Proactively exit a bit before GitHub Actions would kill the job, so the
-  // session gets saved and the next scheduled run can pick up cleanly.
   if (MAX_RUNTIME_SECONDS > 0) {
     console.log(`Will self-restart after ${MAX_RUNTIME_SECONDS}s to stay under the job time limit.`);
     setTimeout(() => shutdown('scheduled restart'), MAX_RUNTIME_SECONDS * 1000);
