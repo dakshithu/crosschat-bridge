@@ -1,16 +1,10 @@
 name: Discord-Zoom Bridge
 
 on:
-  # Kicks off a fresh run automatically before the previous one is killed.
-  # GitHub Actions hard-caps a single job at 6 hours, so this runs every 5.
   schedule:
     - cron: '0 */5 * * *'
-  # Lets you trigger a run manually from the Actions tab, e.g. after
-  # updating auth.json or right after setting this up.
   workflow_dispatch: {}
 
-# Prevents two copies of the bridge running at once if a run overlaps
-# with the next scheduled trigger.
 concurrency:
   group: discord-zoom-bridge
   cancel-in-progress: false
@@ -18,7 +12,7 @@ concurrency:
 jobs:
   run-bridge:
     runs-on: ubuntu-latest
-    timeout-minutes: 340 # 5h40m — under the 6h hard limit
+    timeout-minutes: 340
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,34 +28,33 @@ jobs:
       - name: Install Playwright browser
         run: npx playwright install --with-deps chromium
 
-      # Restores the last saved Zoom login session (auth.json), so the
-      # bridge doesn't have to log in from scratch on every restart.
+      # 1. Look for existing cache from previous runs
       - name: Restore Zoom session cache
         id: cache-auth
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: auth.json
-          key: zoom-auth-${{ github.run_number }}
+          key: zoom-auth-session
           restore-keys: |
-            zoom-auth-
+            zoom-auth-session
 
-      # First-ever run: no cache exists yet, so seed auth.json from a
-      # one-time compressed secret to bypass GitHub's 48KB limit.
-      - name: Seed auth.json from secret if no cache was found
+      # 2. If no cache found, seed from compressed secret
+      - name: Seed auth.json from secret if no cache
         if: steps.cache-auth.outputs.cache-hit != 'true'
         env:
           ZOOM_AUTH_STATE_B64: ${{ secrets.ZOOM_AUTH_STATE_B64 }}
         run: |
           if [ -f auth.json ]; then
-            echo "auth.json restored from cache."
+            echo "auth.json already present."
           elif [ -n "$ZOOM_AUTH_STATE_B64" ]; then
             echo "$ZOOM_AUTH_STATE_B64" | base64 -d | gzip -d > auth.json
-            echo "auth.json seeded from compressed ZOOM_AUTH_STATE_B64 secret."
+            echo "auth.json successfully seeded from ZOOM_AUTH_STATE_B64."
           else
-            echo "::error::No cached auth.json and no ZOOM_AUTH_STATE_B64 secret found. See setup instructions to generate one."
+            echo "::error::No cached auth.json and no ZOOM_AUTH_STATE_B64 secret found."
             exit 1
           fi
 
+      # 3. Run the bridge
       - name: Run bridge
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
@@ -71,7 +64,21 @@ jobs:
           ZOOM_VERIFICATION_TOKEN: ${{ secrets.ZOOM_VERIFICATION_TOKEN }}
           ZOOM_INCOMING_WEBHOOK_URL_RAW: ${{ secrets.ZOOM_INCOMING_WEBHOOK_URL_RAW }}
           IS_HEADLESS: 'true'
-          # Self-exits at 5h30m so auth.json gets saved and the cache step
-          # can run before the 5h40m job timeout kills it outright.
           MAX_RUNTIME_SECONDS: '19800'
         run: node index.js
+
+      # 4. Save refreshed auth.json for the next scheduled workflow
+      - name: Save refreshed auth state to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: auth.json
+          key: zoom-auth-session-${{ github.run_id }}
+
+      # 5. Export screenshot so we can see what Zoom looks like
+      - name: Upload Debug Screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zoom-debug-view
+          path: zoom-loaded-view.png
