@@ -183,6 +183,7 @@ async function sendToZoomWebhook(authorName, textContent, attachments = []) {
 }
 
 async function startBridge() {
+  // Strip BOM if present to prevent Playwright JSON.parse crash
   if (fs.existsSync('auth.json')) {
     try {
       let raw = fs.readFileSync('auth.json', 'utf8');
@@ -194,6 +195,7 @@ async function startBridge() {
       console.error('[Auth] Failed to clean BOM:', err);
     }
   }
+
   const browser = await chromium.launch({
     headless: IS_HEADLESS,
     args: [
@@ -228,15 +230,44 @@ async function startBridge() {
   });
 
   console.log('Navigating to Zoom Chat...');
-  await activePage.goto(ZOOM_INVITE_URL, { waitUntil: 'networkidle' });
+  await activePage.goto(ZOOM_INVITE_URL, { waitUntil: 'domcontentloaded' });
+  await activePage.waitForTimeout(4000);
 
-  try {
-    const browserLink = activePage.locator('text=/Open chat from browser|open chat/i').first();
-    await browserLink.waitFor({ state: 'visible', timeout: 10000 });
-    await browserLink.click({ force: true });
-  } catch (_) {
-    console.log('No "open chat from browser" prompt found, proceeding...');
+  console.log(`[PAGE STATE] Current URL: ${activePage.url()}`);
+  console.log(`[PAGE STATE] Page Title: ${await activePage.title()}`);
+
+  // Try common variants for invite join / browser launch buttons
+  const possibleSelectors = [
+    'button:has-text("Join")',
+    'button:has-text("Launch")',
+    'button:has-text("Open")',
+    'a:has-text("Join")',
+    'a:has-text("Open chat")',
+    'a:has-text("Open in browser")',
+    'a:has-text("Join from your browser")',
+    'text=/Join Chat|Open chat from browser|Open in browser|Join from your browser/i'
+  ];
+
+  for (const selector of possibleSelectors) {
+    try {
+      const el = activePage.locator(selector).first();
+      if (await el.isVisible({ timeout: 2000 })) {
+        console.log(`[PAGE STATE] Found clickable element matching "${selector}". Clicking...`);
+        await el.click({ force: true });
+        await activePage.waitForTimeout(3000);
+        break;
+      }
+    } catch (_) {}
   }
+
+  // Fallback check if page displays secondary browser fallback link
+  try {
+    const fallbackBrowserLink = activePage.locator('text=/having issues.*browser|join from your browser/i').first();
+    if (await fallbackBrowserLink.isVisible({ timeout: 2000 })) {
+      console.log('[PAGE STATE] Clicking secondary fallback browser link...');
+      await fallbackBrowserLink.click({ force: true });
+    }
+  } catch (_) {}
 
   // Wait for the chat container to mount
   console.log('Waiting for chat view to load...');
