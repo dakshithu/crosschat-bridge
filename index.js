@@ -183,6 +183,17 @@ async function sendToZoomWebhook(authorName, textContent, attachments = []) {
 }
 
 async function startBridge() {
+  if (fs.existsSync('auth.json')) {
+    try {
+      let raw = fs.readFileSync('auth.json', 'utf8');
+      if (raw.charCodeAt(0) === 0xFEFF) {
+        fs.writeFileSync('auth.json', raw.slice(1), 'utf8');
+        console.log('[Auth] Cleaned leading BOM from auth.json');
+      }
+    } catch (err) {
+      console.error('[Auth] Failed to clean BOM:', err);
+    }
+  }
   const browser = await chromium.launch({
     headless: IS_HEADLESS,
     args: [
