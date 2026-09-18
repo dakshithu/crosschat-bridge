@@ -183,7 +183,7 @@ async function sendToZoomWebhook(authorName, textContent, attachments = []) {
 }
 
 async function startBridge() {
-  // Strip BOM if present to prevent Playwright JSON.parse crash
+  // Strip UTF-8 BOM if present to prevent Playwright JSON parse crash
   if (fs.existsSync('auth.json')) {
     try {
       let raw = fs.readFileSync('auth.json', 'utf8');
@@ -232,21 +232,19 @@ async function startBridge() {
   });
 
   console.log('Navigating to Zoom Chat...');
-    try {
-      await activePage.goto(ZOOM_INVITE_URL, { 
-        waitUntil: 'commit',
-        timeout: 60000 
-      });
-    } catch (navErr) {
-      console.log(`[PAGE STATE] Navigation notice: ${navErr.message}. Continuing...`);
-    }
-  
-    // Allow DOM elements and scripts to mount
-    await activePage.waitForTimeout(7000);
+  try {
+    await activePage.goto(ZOOM_INVITE_URL, { 
+      waitUntil: 'commit',
+      timeout: 60000 
+    });
+  } catch (navErr) {
+    console.log(`[PAGE STATE] Navigation notice: ${navErr.message}. Continuing...`);
+  }
 
+  await activePage.waitForTimeout(6000);
   console.log(`[PAGE STATE] Current URL: ${activePage.url()}`);
 
-  // Force-click via DOM evaluation
+  // Force-click via direct DOM evaluation
   const clicked = await activePage.evaluate(() => {
     const clickable = Array.from(document.querySelectorAll('a, button, span, div[role="button"]'));
     const target = clickable.find(el => {
