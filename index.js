@@ -232,8 +232,17 @@ async function startBridge() {
   });
 
   console.log('Navigating to Zoom Chat...');
-  await activePage.goto(ZOOM_INVITE_URL, { waitUntil: 'load' });
-  await activePage.waitForTimeout(5000);
+    try {
+      await activePage.goto(ZOOM_INVITE_URL, { 
+        waitUntil: 'commit',
+        timeout: 60000 
+      });
+    } catch (navErr) {
+      console.log(`[PAGE STATE] Navigation notice: ${navErr.message}. Continuing...`);
+    }
+  
+    // Allow DOM elements and scripts to mount
+    await activePage.waitForTimeout(7000);
 
   console.log(`[PAGE STATE] Current URL: ${activePage.url()}`);
 
