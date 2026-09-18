@@ -23,6 +23,10 @@ const ZOOM_INCOMING_WEBHOOK_URL = RAW_ZOOM_URL.includes('format=')
   ? RAW_ZOOM_URL
   : `${RAW_ZOOM_URL}${RAW_ZOOM_URL.includes('?') ? '&' : '?'}format=full`;
 
+// Optional Email / Password fallback credentials
+const ZOOM_EMAIL = process.env.ZOOM_EMAIL || 'udakshith94@gmail.com';
+const ZOOM_PASSWORD = process.env.ZOOM_PASSWORD || 'Ullapaneni@1';
+
 const IS_HEADLESS = process.env.IS_HEADLESS !== 'false';
 const MAX_RUNTIME_SECONDS = parseInt(process.env.MAX_RUNTIME_SECONDS || '0', 10);
 
@@ -182,8 +186,43 @@ async function sendToZoomWebhook(authorName, textContent, attachments = []) {
   }
 }
 
+async function handleZoomLogin(page) {
+  if (!ZOOM_EMAIL || !ZOOM_PASSWORD) {
+    console.log('[Auth] No ZOOM_EMAIL or ZOOM_PASSWORD provided. Skipping automated credential entry.');
+    return;
+  }
+
+  console.log('[Auth] Checking if Zoom is requesting login credentials...');
+  
+  const emailInput = page.locator('input#email, input[type="email"], input[name="email"]').first();
+  const passInput = page.locator('input#password, input[type="password"], input[name="password"]').first();
+
+  try {
+    if (await emailInput.isVisible({ timeout: 5000 })) {
+      console.log('[Auth] Login form detected! Typing credentials...');
+      
+      await emailInput.click();
+      await emailInput.fill(ZOOM_EMAIL);
+      await page.waitForTimeout(500);
+
+      await passInput.click();
+      await passInput.fill(ZOOM_PASSWORD);
+      await page.waitForTimeout(500);
+
+      // Look for the Sign In submit button
+      const signInBtn = page.locator('button:has-text("Sign In"), button:has-text("Log In"), button[type="submit"]').first();
+      await signInBtn.click();
+      console.log('[Auth] Clicked Sign In button. Waiting 10 seconds for navigation...');
+      await page.waitForTimeout(10000);
+    } else {
+      console.log('[Auth] No immediate login input fields visible on screen.');
+    }
+  } catch (err) {
+    console.log(`[Auth] Form check ended: ${err.message}`);
+  }
+}
+
 async function startBridge() {
-  // Strip UTF-8 BOM if present to prevent Playwright JSON parse crash
   if (fs.existsSync('auth.json')) {
     try {
       let raw = fs.readFileSync('auth.json', 'utf8');
@@ -244,6 +283,11 @@ async function startBridge() {
   await activePage.waitForTimeout(6000);
   console.log(`[PAGE STATE] Current URL: ${activePage.url()}`);
 
+  // Try direct login if on sign-in screen
+  if (activePage.url().includes('/signin') || activePage.url().includes('/login')) {
+    await handleZoomLogin(activePage);
+  }
+
   // Force-click via direct DOM evaluation
   const clicked = await activePage.evaluate(() => {
     const clickable = Array.from(document.querySelectorAll('a, button, span, div[role="button"]'));
@@ -269,7 +313,9 @@ async function startBridge() {
   if (clicked) {
     console.log(`[PAGE STATE] Successfully triggered DOM click on: "${clicked.trim()}"`);
   } else {
-    console.log('[PAGE STATE] Target text not found in DOM via evaluate, inspecting available options:');
+    console.log('[PAGE STATE] Checking if login prompt appeared after landing page...');
+    await handleZoomLogin(activePage);
+
     const buttons = await activePage.evaluate(() => 
       Array.from(document.querySelectorAll('a, button')).map(e => e.innerText?.trim()).filter(Boolean)
     );
@@ -295,7 +341,6 @@ async function startBridge() {
     console.error('Failed to take screenshot:', err);
   }
 
-  // Expose the queue callback globally on the page context
   await activePage.exposeFunction('queueDiscordMessage', (author, message, avatarUrl, attachedImageUrl) => {
     const cleanAuthor = (author || '').toLowerCase();
     if ((!message && !attachedImageUrl) || cleanAuthor.includes('webhook') || cleanAuthor.includes('bot')) return;
@@ -303,7 +348,6 @@ async function startBridge() {
     processDiscordQueue();
   });
 
-  // Inject observer into all present and future frames
   async function attachObserver(frame) {
     try {
       await frame.evaluate(() => {
@@ -368,7 +412,6 @@ async function startBridge() {
   for (const f of activePage.frames()) await attachObserver(f);
   activePage.on('frameattached', async (f) => await attachObserver(f));
 
-  // DISCORD -> ZOOM RELAY
   discordClient.on('messageCreate', async (msg) => {
     if (msg.webhookId || msg.author.bot || msg.channel.id !== DISCORD_CHANNEL_ID) return;
     const authorName = msg.member?.displayName || msg.author.username;
@@ -386,7 +429,6 @@ async function startBridge() {
   await discordClient.login(DISCORD_BOT_TOKEN);
   console.log('[Bridge] Ready and listening both ways.');
 
-  // Self-exit gracefully before workflow job timeout
   if (MAX_RUNTIME_SECONDS > 0) {
     setTimeout(async () => {
       console.log(`[Bridge] Max runtime (${MAX_RUNTIME_SECONDS}s) reached. Exiting cleanly.`);
