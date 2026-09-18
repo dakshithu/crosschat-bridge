@@ -24,6 +24,8 @@ const ZOOM_INCOMING_WEBHOOK_URL = RAW_ZOOM_URL.includes('format=')
   : `${RAW_ZOOM_URL}${RAW_ZOOM_URL.includes('?') ? '&' : '?'}format=full`;
 
 const IS_HEADLESS = process.env.IS_HEADLESS !== 'false';
+const MAX_RUNTIME_SECONDS = parseInt(process.env.MAX_RUNTIME_SECONDS || '0', 10);
+
 const discordMsgTextMap = new Map();
 const discordQueue = [];
 let isProcessingDiscordQueue = false;
@@ -181,24 +183,31 @@ async function sendToZoomWebhook(authorName, textContent, attachments = []) {
 }
 
 async function startBridge() {
-  if (fs.existsSync('auth.b64')) {
-    try {
-      const b64Data = fs.readFileSync('auth.b64', 'utf-8').trim();
-      fs.writeFileSync('auth.json', Buffer.from(b64Data, 'base64').toString('utf-8'), 'utf-8');
-    } catch (err) {
-      console.error('[Auth] Failed to decode auth.b64:', err);
-    }
-  }
-
   const browser = await chromium.launch({
     headless: IS_HEADLESS,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled'
+    ]
   });
 
+  const hasAuth = fs.existsSync('auth.json');
+  console.log(`[Auth] Using auth.json: ${hasAuth}`);
+
   const context = await browser.newContext({
-    storageState: fs.existsSync('auth.json') ? 'auth.json' : undefined,
-    viewport: { width: 1920, height: 1080 }
+    storageState: hasAuth ? 'auth.json' : undefined,
+    viewport: { width: 1920, height: 1080 },
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
   });
+
+  // Periodically refresh and save session state
+  setInterval(async () => {
+    try {
+      await context.storageState({ path: 'auth.json' });
+    } catch (_) {}
+  }, 60000);
 
   let activePage = await context.newPage();
 
@@ -214,11 +223,21 @@ async function startBridge() {
     const browserLink = activePage.locator('text=/Open chat from browser|open chat/i').first();
     await browserLink.waitFor({ state: 'visible', timeout: 10000 });
     await browserLink.click({ force: true });
-  } catch (_) {}
+  } catch (_) {
+    console.log('No "open chat from browser" prompt found, proceeding...');
+  }
 
   // Wait for the chat container to mount
   console.log('Waiting for chat view to load...');
   await activePage.waitForTimeout(15000);
+
+  // Capture current state to debug CI runs
+  try {
+    await activePage.screenshot({ path: 'zoom-loaded-view.png', fullPage: true });
+    console.log('[DEBUG] Saved view to zoom-loaded-view.png');
+  } catch (err) {
+    console.error('Failed to take screenshot:', err);
+  }
 
   // Expose the queue callback globally on the page context
   await activePage.exposeFunction('queueDiscordMessage', (author, message, avatarUrl, attachedImageUrl) => {
@@ -257,7 +276,6 @@ async function startBridge() {
           let body = text;
 
           if (lines.length >= 2) {
-            // Usually [Name, Time, Text...] or [Initials, Name, Time, Text...]
             const timeIdx = lines.findIndex(l => /^[0-9]{1,2}:[0-9]{2}(\s*[AP]M)?$/i.test(l));
             if (timeIdx > 0) {
               author = lines[timeIdx - 1];
@@ -293,7 +311,6 @@ async function startBridge() {
     } catch (_) {}
   }
 
-  // Bind to current frames and handle navigation
   for (const f of activePage.frames()) await attachObserver(f);
   activePage.on('frameattached', async (f) => await attachObserver(f));
 
@@ -314,6 +331,18 @@ async function startBridge() {
 
   await discordClient.login(DISCORD_BOT_TOKEN);
   console.log('[Bridge] Ready and listening both ways.');
+
+  // Self-exit gracefully before workflow job timeout
+  if (MAX_RUNTIME_SECONDS > 0) {
+    setTimeout(async () => {
+      console.log(`[Bridge] Max runtime (${MAX_RUNTIME_SECONDS}s) reached. Exiting cleanly.`);
+      try {
+        await context.storageState({ path: 'auth.json' });
+        await browser.close();
+      } catch (_) {}
+      process.exit(0);
+    }, MAX_RUNTIME_SECONDS * 1000);
+  }
 }
 
 startBridge();
