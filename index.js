@@ -202,7 +202,9 @@ async function startBridge() {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled'
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=PreloadMediaEngagementData,AutofillServerCommunication',
+      '--no-default-browser-check'
     ]
   });
 
@@ -212,10 +214,10 @@ async function startBridge() {
   const context = await browser.newContext({
     storageState: hasAuth ? 'auth.json' : undefined,
     viewport: { width: 1920, height: 1080 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    permissions: []
   });
 
-  // Periodically refresh and save session state
   setInterval(async () => {
     try {
       await context.storageState({ path: 'auth.json' });
@@ -230,50 +232,55 @@ async function startBridge() {
   });
 
   console.log('Navigating to Zoom Chat...');
-  await activePage.goto(ZOOM_INVITE_URL, { waitUntil: 'domcontentloaded' });
-  await activePage.waitForTimeout(4000);
+  await activePage.goto(ZOOM_INVITE_URL, { waitUntil: 'load' });
+  await activePage.waitForTimeout(5000);
 
   console.log(`[PAGE STATE] Current URL: ${activePage.url()}`);
-  console.log(`[PAGE STATE] Page Title: ${await activePage.title()}`);
 
-  // Try common variants for invite join / browser launch buttons
-  const possibleSelectors = [
-    'button:has-text("Join")',
-    'button:has-text("Launch")',
-    'button:has-text("Open")',
-    'a:has-text("Join")',
-    'a:has-text("Open chat")',
-    'a:has-text("Open in browser")',
-    'a:has-text("Join from your browser")',
-    'text=/Join Chat|Open chat from browser|Open in browser|Join from your browser/i'
-  ];
+  // Force-click via DOM evaluation
+  const clicked = await activePage.evaluate(() => {
+    const clickable = Array.from(document.querySelectorAll('a, button, span, div[role="button"]'));
+    const target = clickable.find(el => {
+      const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+      return (
+        txt.includes('open chat from browser') ||
+        txt.includes('open in browser') ||
+        txt.includes('join from your browser') ||
+        txt.includes('launch chat in browser') ||
+        txt.includes('having issues with the application? join from your browser')
+      );
+    });
 
-  for (const selector of possibleSelectors) {
+    if (target) {
+      target.scrollIntoView();
+      target.click();
+      return target.innerText || target.textContent;
+    }
+    return null;
+  });
+
+  if (clicked) {
+    console.log(`[PAGE STATE] Successfully triggered DOM click on: "${clicked.trim()}"`);
+  } else {
+    console.log('[PAGE STATE] Target text not found in DOM via evaluate, inspecting available options:');
+    const buttons = await activePage.evaluate(() => 
+      Array.from(document.querySelectorAll('a, button')).map(e => e.innerText?.trim()).filter(Boolean)
+    );
+    console.log('[PAGE STATE] Available buttons/links on page:', JSON.stringify(buttons));
+
     try {
-      const el = activePage.locator(selector).first();
-      if (await el.isVisible({ timeout: 2000 })) {
-        console.log(`[PAGE STATE] Found clickable element matching "${selector}". Clicking...`);
-        await el.click({ force: true });
-        await activePage.waitForTimeout(3000);
-        break;
+      const fallback = activePage.getByRole('button', { name: /open|join|browser/i }).or(activePage.getByRole('link', { name: /open|join|browser/i }));
+      if (await fallback.first().isVisible({ timeout: 3000 })) {
+        await fallback.first().click({ force: true });
+        console.log('[PAGE STATE] Clicked fallback locator.');
       }
     } catch (_) {}
   }
 
-  // Fallback check if page displays secondary browser fallback link
-  try {
-    const fallbackBrowserLink = activePage.locator('text=/having issues.*browser|join from your browser/i').first();
-    if (await fallbackBrowserLink.isVisible({ timeout: 2000 })) {
-      console.log('[PAGE STATE] Clicking secondary fallback browser link...');
-      await fallbackBrowserLink.click({ force: true });
-    }
-  } catch (_) {}
-
-  // Wait for the chat container to mount
-  console.log('Waiting for chat view to load...');
+  console.log('Waiting 15s for chat view to mount...');
   await activePage.waitForTimeout(15000);
+  console.log(`[PAGE STATE AFTER WAIT] Final URL: ${activePage.url()}`);
 
-  // Capture current state to debug CI runs
   try {
     await activePage.screenshot({ path: 'zoom-loaded-view.png', fullPage: true });
     console.log('[DEBUG] Saved view to zoom-loaded-view.png');
@@ -302,7 +309,6 @@ async function startBridge() {
         function checkNode(el) {
           if (!el || el.nodeType !== Node.ELEMENT_NODE) return;
 
-          // Target list items, message rows, or container blocks
           const isMsgRow = el.matches('[role="row"], [role="listitem"], div[data-testid*="message"], div[class*="chatMessage"], div[class*="message-item"]');
           const target = isMsgRow ? el : el.querySelector('[role="row"], [role="listitem"], div[data-testid*="message"], div[class*="chatMessage"]');
 
@@ -312,7 +318,6 @@ async function startBridge() {
           if (!text || seenItems.has(text)) return;
           if (text.toLowerCase().includes('via discord') || text.toLowerCase().includes('incoming webhook')) return;
 
-          // Extract sender and content
           const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
           let author = lastAuthor;
           let body = text;
